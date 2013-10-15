@@ -9,14 +9,27 @@
 # option) any later version.  See http://www.gnu.org/copyleft/gpl.html for
 # the full text of the license.
 
-import cookielib
 import os
-import StringIO
-import urllib2
-import urlparse
-import xmlrpclib
+import sys
+import locale
 
-import pycurl
+if sys.version_info.major >= 3:
+    # pylint: disable=F0401,E0611
+    from configparser import SafeConfigParser
+    from http.cookiejar import LoadError, LWPCookieJar, MozillaCookieJar
+    from urllib.parse import urlparse, parse_qsl
+    from xmlrpc.client import (
+        Binary, Fault, ProtocolError, ServerProxy, Transport)
+else:
+    from ConfigParser import SafeConfigParser
+    from cookielib import LoadError, LWPCookieJar, MozillaCookieJar
+    from urlparse import urlparse, parse_qsl
+    from xmlrpclib import (
+        Binary, Fault, ProtocolError, ServerProxy, Transport)
+
+# pylint: disable=F0401
+import requests
+from io import BytesIO
 
 from bugzilla import __version__, log
 from bugzilla.bug import _Bug, _User
@@ -29,6 +42,7 @@ mimemagic = None
 
 
 def _detect_filetype(fname):
+    # pylint: disable=E1103
     global mimemagic
 
     if mimemagic is None:
@@ -36,7 +50,8 @@ def _detect_filetype(fname):
             import magic
             mimemagic = magic.open(magic.MAGIC_MIME_TYPE)
             mimemagic.load()
-        except ImportError, e:
+        except ImportError:
+            e = sys.exc_info()[1]
             log.debug("Could not load python-magic: %s", e)
             mimemagic = False
     if mimemagic is False:
@@ -47,33 +62,20 @@ def _detect_filetype(fname):
 
     try:
         return mimemagic.file(fname)
-    except Exception, e:
+    except Exception:
+        e = sys.exc_info()[1]
         log.debug("Could not detect content_type: %s", e)
     return None
 
 
-def _decode_rfc2231_value(val):
-    # BUG WORKAROUND: decode_header doesn't work unless there's whitespace
-    # around the encoded string (see http://bugs.python.org/issue1079)
-    from email import utils
-    from email import header
-
-    # pylint: disable=W1401
-    # Anomolous backslash in string
-    val = utils.ecre.sub(' \g<0> ', val)
-    val = val.strip('"')
-    return ''.join(f[0].decode(f[1] or 'us-ascii')
-                   for f in header.decode_header(val))
-
-
 def _build_cookiejar(cookiefile):
-    cj = cookielib.MozillaCookieJar(cookiefile)
+    cj = MozillaCookieJar(cookiefile)
     if cookiefile is None:
         return cj
     if not os.path.exists(cookiefile):
         # Make sure a new file has correct permissions
         open(cookiefile, 'a').close()
-        os.chmod(cookiefile, 0600)
+        os.chmod(cookiefile, 0o600)
         cj.save()
         return cj
 
@@ -82,150 +84,103 @@ def _build_cookiejar(cookiefile):
     try:
         cj.load()
         return cj
-    except cookielib.LoadError:
+    except LoadError:
         pass
 
     try:
-        cj = cookielib.LWPCookieJar(cookiefile)
+        cj = LWPCookieJar(cookiefile)
         cj.load()
-    except cookielib.LoadError:
+    except LoadError:
         raise BugzillaError("cookiefile=%s not in LWP or Mozilla format" %
                             cookiefile)
 
-    retcj = cookielib.MozillaCookieJar(cookiefile)
+    retcj = MozillaCookieJar(cookiefile)
     for cookie in cj:
         retcj.set_cookie(cookie)
     retcj.save()
     return retcj
 
 
-def _check_http_error(uri, request_body, response_data):
-    # This pulls some of the guts from urllib to give us HTTP error
-    # code checking. Wrap it all in try/except incase this breaks in
-    # the future, it's only for error handling.
-    try:
-        import httplib
-        import urllib
+class RequestsTransport(Transport):
+    user_agent = 'Python/Bugzilla'
 
-        class FakeSocket(StringIO.StringIO):
-            def makefile(self, *args, **kwarg):
-                ignore = args
-                ignore = kwarg
-                return self
-
-        httpresp = httplib.HTTPResponse(FakeSocket(response_data))
-        httpresp.begin()
-        resp = urllib.addinfourl(FakeSocket(response_data), httpresp.msg, uri)
-        resp.code = httpresp.status
-        resp.msg = httpresp.reason
-
-        req = urllib2.Request(uri)
-        req.add_data(request_body)
-        opener = urllib2.build_opener()
-
-        for handler in opener.handlers:
-            if hasattr(handler, "http_response"):
-                handler.http_response(req, resp)
-    except urllib2.HTTPError:
-        raise
-    except:
-        pass
-
-
-class _CURLTransport(xmlrpclib.Transport):
     def __init__(self, url, cookiejar,
                  sslverify=True, sslcafile=None, debug=0):
-        if hasattr(xmlrpclib.Transport, "__init__"):
-            xmlrpclib.Transport.__init__(self, use_datetime=False)
+        # pylint: disable=W0231
+        # pylint does not handle multiple import of Transport well
+        if hasattr(Transport, "__init__"):
+            Transport.__init__(self, use_datetime=False)
 
         self.verbose = debug
+        self._cookiejar = cookiejar
 
         # transport constructor needs full url too, as xmlrpc does not pass
         # scheme to request
-        self.scheme = urlparse.urlparse(url)[0]
+        self.scheme = urlparse(url)[0]
         if self.scheme not in ["http", "https"]:
             raise Exception("Invalid URL scheme: %s (%s)" % (self.scheme, url))
 
-        self.c = pycurl.Curl()
-        self.c.setopt(pycurl.POST, 1)
-        self.c.setopt(pycurl.CONNECTTIMEOUT, 30)
-        self.c.setopt(pycurl.HTTPHEADER, [
-            "Content-Type: text/xml",
-        ])
-        self.c.setopt(pycurl.VERBOSE, debug)
+        self.use_https = self.scheme == 'https'
 
-        self.set_cookiejar(cookiejar)
+        self.request_defaults = {
+            'cert': sslcafile if self.use_https else None,
+            'cookies': cookiejar,
+            'verify': sslverify,
+            'headers': {
+                'Content-Type': 'text/xml',
+                'User-Agent': self.user_agent,
+            }
+        }
 
-        # ssl settings
-        if self.scheme == "https":
-            # override curl built-in ca file setting
-            if sslcafile is not None:
-                self.c.setopt(pycurl.CAINFO, sslcafile)
+    def parse_response(self, response):
+        """ Parse XMLRPC response """
+        parser, unmarshaller = self.getparser()
+        parser.feed(response.text.encode('utf-8'))
+        parser.close()
+        return unmarshaller.close()
 
-            # disable ssl verification
-            if not sslverify:
-                self.c.setopt(pycurl.SSL_VERIFYPEER, 0)
-                self.c.setopt(pycurl.SSL_VERIFYHOST, 0)
-
-    def set_cookiejar(self, cj):
-        self.c.setopt(pycurl.COOKIEFILE, cj.filename or "")
-        self.c.setopt(pycurl.COOKIEJAR, cj.filename or "")
-
-    def get_cookies(self):
-        return self.c.getinfo(pycurl.INFO_COOKIELIST)
-
-    def _open_helper(self, url, request_body):
-        self.c.setopt(pycurl.URL, url)
-        self.c.setopt(pycurl.POSTFIELDS, request_body)
-
-        b = StringIO.StringIO()
-        headers = StringIO.StringIO()
-        self.c.setopt(pycurl.WRITEFUNCTION, b.write)
-        self.c.setopt(pycurl.HEADERFUNCTION, headers.write)
-
+    def _request_helper(self, url, request_body):
+        """
+        A helper method to assist in making a request and provide a parsed
+        response.
+        """
         try:
-            m = pycurl.CurlMulti()
-            m.add_handle(self.c)
-            while True:
-                if m.perform()[0] == -1:
-                    continue
-                num, ok, err = m.info_read()
-                ignore = num
+            response = requests.post(
+                url, data=request_body, **self.request_defaults)
 
-                if ok:
-                    m.remove_handle(self.c)
-                    break
-                if err:
-                    m.remove_handle(self.c)
-                    raise pycurl.error(*err[0][1:])
-                if m.select(.1) == -1:
-                    # Looks like -1 is passed straight up from select(2)
-                    # While it's not true that this will always be caused
-                    # by SIGINT, it should be the only case we hit
-                    log.debug("pycurl select failed, this likely came from "
-                              "SIGINT, raising")
-                    m.remove_handle(self.c)
-                    raise KeyboardInterrupt
-        except pycurl.error, e:
-            raise xmlrpclib.ProtocolError(url, e[0], e[1], None)
+            # We expect utf-8 from the server
+            response.encoding = 'UTF-8'
 
-        b.seek(0)
-        headers.seek(0)
-        return b, headers
+            # update/set any cookies
+            for cookie in response.cookies:
+                self._cookiejar.set_cookie(cookie)
+
+            if self._cookiejar.filename is not None:
+                # Save is required only if we have a filename
+                self._cookiejar.save()
+
+            response.raise_for_status()
+            return self.parse_response(response)
+        except requests.RequestException:
+            e = sys.exc_info()[1]
+            raise ProtocolError(
+                url, response.status_code, str(e), response.headers)
+        except Fault:
+            raise sys.exc_info()[1]
+        except Exception:
+            # pylint: disable=W0201
+            e = BugzillaError(str(sys.exc_info()[1]))
+            e.__traceback__ = sys.exc_info()[2]
+            raise e
 
     def request(self, host, handler, request_body, verbose=0):
         self.verbose = verbose
         url = "%s://%s%s" % (self.scheme, host, handler)
 
         # xmlrpclib fails to escape \r
-        request_body = request_body.replace('\r', '&#xd;')
+        request_body = request_body.replace(b'\r', b'&#xd;')
 
-        body, headers = self._open_helper(url, request_body)
-        _check_http_error(url, body.getvalue(), headers.getvalue())
-
-        return self.parse_response(body)
-
-
+        return self._request_helper(url, request_body)
 
 
 class BugzillaError(Exception):
@@ -282,12 +237,12 @@ class BugzillaBase(object):
         '''
         q = {}
         (ignore, ignore, path,
-         ignore, query, ignore) = urlparse.urlparse(url)
+         ignore, query, ignore) = urlparse(url)
 
         if os.path.basename(path) not in ('buglist.cgi', 'query.cgi'):
             return {}
 
-        for (k, v) in urlparse.parse_qsl(query):
+        for (k, v) in parse_qsl(query):
             if k not in q:
                 q[k] = v
             elif isinstance(q[k], list):
@@ -348,9 +303,13 @@ class BugzillaBase(object):
         self._components_details = {}
 
     def _get_user_agent(self):
-        ret = ('Python-urllib2/%s bugzilla.py/%s %s/%s' %
-               (urllib2.__version__, __version__,
-                str(self.__class__.__name__), self.version))
+        ret = (
+            'Python-urllib bugzilla.py/%s %s/%s' % (
+                __version__,
+                str(self.__class__.__name__),
+                self.version
+            )
+        )
         return ret
     user_agent = property(_get_user_agent)
 
@@ -428,11 +387,10 @@ class BugzillaBase(object):
         '''
         Read bugzillarc file(s) into memory.
         '''
-        import ConfigParser
         if not configpath:
             configpath = self.configpath
         configpath = [os.path.expanduser(p) for p in configpath]
-        c = ConfigParser.SafeConfigParser()
+        c = SafeConfigParser()
         r = c.read(configpath)
         if not r:
             return
@@ -440,8 +398,7 @@ class BugzillaBase(object):
         section = ""
         # Substring match - prefer the longest match found
         log.debug("Searching for config section matching %s", self.url)
-        for s in sorted(c.sections(),
-                        lambda a, b: cmp(len(a), len(b)) or cmp(a, b)):
+        for s in sorted(c.sections()):
             if s in self.url:
                 log.debug("Found matching section: %s" % s)
                 section = s
@@ -466,11 +423,10 @@ class BugzillaBase(object):
             url = self.url
         url = self.fix_url(url)
 
-        self._transport = _CURLTransport(url, self._cookiejar,
-                                         sslverify=self._sslverify)
+        self._transport = RequestsTransport(
+            url, self._cookiejar, sslverify=self._sslverify)
         self._transport.user_agent = self.user_agent
-        self._proxy = xmlrpclib.ServerProxy(url, self._transport)
-
+        self._proxy = ServerProxy(url, self._transport)
 
         self.url = url
         # we've changed URLs - reload config
@@ -525,7 +481,7 @@ class BugzillaBase(object):
             self.logged_in = True
             log.info("login successful - dropping password from memory")
             self.password = ''
-        except xmlrpclib.Fault:
+        except Fault:
             r = False
 
         return r
@@ -970,9 +926,7 @@ class BugzillaBase(object):
         }
 
         # Strip out None elements in the dict
-        for key in query.keys():
-            if query[key] is None:
-                del(query[key])
+        query = {k: v for k, v in query.items() if v is not None}
         return query
 
     def _query(self, query):
@@ -1212,7 +1166,7 @@ class BugzillaBase(object):
     def attachfile(self, idlist, attachfile, description, **kwargs):
         '''
         Attach a file to the given bug IDs. Returns the ID of the attachment
-        or raises xmlrpclib.Fault if something goes wrong.
+        or raises XMLRPC Fault if something goes wrong.
 
         attachfile may be a filename (which will be opened) or a file-like
         object, which must provide a 'read' method. If it's not one of these,
@@ -1253,7 +1207,11 @@ class BugzillaBase(object):
             kwargs["file_name"] = kwargs.pop("filename")
 
         kwargs['summary'] = description
-        kwargs['data'] = xmlrpclib.Binary(f.read())
+
+        data = f.read()
+        if not isinstance(data, bytes):
+            data = data.encode(locale.getpreferredencoding())
+        kwargs['data'] = Binary(data)
         kwargs['ids'] = self._listify(idlist)
 
         if 'file_name' not in kwargs and hasattr(f, "name"):
@@ -1281,29 +1239,27 @@ class BugzillaBase(object):
     def openattachment(self, attachid):
         '''Get the contents of the attachment with the given attachment ID.
         Returns a file-like object.'''
+
+        def get_filename(headers):
+            import re
+
+            match = re.search(
+                r'^.*filename="?(.*)"$',
+                headers.get('content-disposition', '')
+            )
+
+            # default to attchid if no match was found
+            return match.group(1) if match else attachid
+
         att_uri = self._attachment_uri(attachid)
 
-        headers = {}
-        ret = StringIO.StringIO()
+        response = requests.get(att_uri, cookies=self._cookiejar, stream=True)
 
-        def headers_cb(buf):
-            if not ":" in buf:
-                return
-            name, val = buf.split(":", 1)
-            headers[name.lower()] = val
-
-        c = pycurl.Curl()
-        c.setopt(pycurl.URL, att_uri)
-        c.setopt(pycurl.WRITEFUNCTION, ret.write)
-        c.setopt(pycurl.HEADERFUNCTION, headers_cb)
-        c.setopt(pycurl.COOKIEFILE, self._cookiejar.filename or "")
-        c.perform()
-        c.close()
-
-        disp = headers['content-disposition'].split(';')
-        disp.pop(0)
-        parms = dict([p.strip().split("=", 1) for p in disp])
-        ret.name = _decode_rfc2231_value(parms['filename'])
+        ret = BytesIO()
+        for chunk in response.iter_content(chunk_size=1024):
+            if chunk:
+                ret.write(chunk)
+        ret.name = get_filename(response.headers)
 
         # Hooray, now we have a file-like object with .read() and .name
         ret.seek(0)
@@ -1434,7 +1390,7 @@ class BugzillaBase(object):
         :kwarg names: list of user names to return data on
         :kwarg match: list of patterns.  Returns users whose real name or
             login name match the pattern.
-        :raises xmlrpclib.Fault: Code 51: if a Bad Login Name was sent to the
+        :raises XMLRPC Fault: Code 51: if a Bad Login Name was sent to the
                 names array.
             Code 304: if the user was not authorized to see user they
                 requested.
@@ -1461,7 +1417,7 @@ class BugzillaBase(object):
         '''Return a bugzilla User for the given username
 
         :arg username: The username used in bugzilla.
-        :raises xmlrpclib.Fault: Code 51 if the username does not exist
+        :raises XMLRPC Fault: Code 51 if the username does not exist
         :returns: User record for the username
         '''
         ret = self.getusers(username)
@@ -1503,7 +1459,7 @@ class BugzillaBase(object):
         :arg email: The email address to use in bugzilla
         :kwarg name: Real name to associate with the account
         :kwarg password: Password to set for the bugzilla account
-        :raises xmlrpclib.Fault: Code 501 if the username already exists
+        :raises XMLRPC Fault: Code 501 if the username already exists
             Code 500 if the email address isn't valid
             Code 502 if the password is too short
             Code 503 if the password is too long

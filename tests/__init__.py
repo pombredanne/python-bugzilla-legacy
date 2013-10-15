@@ -1,12 +1,17 @@
 
+from __future__ import print_function
+
 import atexit
-import commands
 import difflib
 import imp
 import os
 import shlex
 import sys
-import StringIO
+
+if sys.version_info.major >= 3:
+    from io import StringIO
+else:
+    from StringIO import StringIO
 
 
 _cleanup = []
@@ -61,7 +66,7 @@ def clicomm(argv, bzinstance, returnmain=False, printcliout=False,
     oldargv = sys.argv
     try:
         if not printcliout:
-            out = StringIO.StringIO()
+            out = StringIO()
             sys.stdout = out
             sys.stderr = out
             if stdin:
@@ -71,11 +76,12 @@ def clicomm(argv, bzinstance, returnmain=False, printcliout=False,
         ret = 0
         mainout = None
         try:
-            print " ".join(argv)
-            print
+            print(" ".join(argv))
+            print()
 
             mainout = bugzillascript.main(bzinstance)
-        except SystemExit, sys_e:
+        except SystemExit:
+            sys_e = sys.exc_info()[1]
             ret = sys_e.code
 
         outt = ""

@@ -9,6 +9,8 @@
 Unit tests for building query strings with bin/bugzilla
 '''
 
+from __future__ import print_function
+
 import atexit
 import os
 import shutil
@@ -18,6 +20,7 @@ import unittest
 import bugzilla
 
 import tests
+
 
 
 class MiscCLI(unittest.TestCase):
@@ -34,8 +37,9 @@ class MiscCLI(unittest.TestCase):
 
             from logilab.common.optik_ext import ManHelpFormatter
             ignore = ManHelpFormatter
-        except Exception, e:
-            print "Skipping man page test: %s" % e
+        except Exception:
+            e = sys.exc_info()[1]
+            print("Skipping man page test: %s" % e)
             return
 
         out = tests.clicomm("bugzilla --generate-man", None)
@@ -68,7 +72,7 @@ class MiscAPI(unittest.TestCase):
     def testCookies(self):
         if (sys.version_info[0] < 2 or
             (sys.version_info[0] == 2 and sys.version_info[1] < 6)):
-            print "\npython too old, skipping cookie test"
+            print("\npython too old, skipping cookie test")
             return
 
         cookiesbad = os.path.join(os.getcwd(), "tests/data/cookies-bad.txt")
@@ -84,7 +88,7 @@ class MiscAPI(unittest.TestCase):
 
         # Mozilla should be converted inplace to LWP
         bugzilla.Bugzilla3(url=None, cookiefile=cookiesnew)
-        self.assertEquals(file(cookiesmoz).read(), file(cookiesnew).read())
+        self.assertEquals(open(cookiesmoz).read(), open(cookiesnew).read())
 
         # Make sure bad cookies raise an error
         try:

@@ -1,11 +1,16 @@
 #!/usr/bin/python
 
+from __future__ import print_function
+
 import glob
 import os
 import sys
 import unittest
 
-from distutils.core import setup, Command
+from setuptools import setup, Command
+
+
+BASE_DIR = os.path.dirname(__file__)
 
 
 def get_version():
@@ -13,6 +18,24 @@ def get_version():
     for line in f:
         if line.startswith('__version__'):
             return eval(line.split('=')[-1])
+
+
+def get_requirements(filename):
+    try:
+        # Do this only when pip is available, else assume dependencies
+        # are managed externally. Eg: rpm spec
+        from pip.req import parse_requirements
+        return [
+            str(r.req)
+            for r in parse_requirements(os.path.join(BASE_DIR, filename))
+        ]
+    except ImportError:
+        return []
+
+
+INSTALL_REQUIREMENTS = get_requirements('requirements.txt')
+TEST_REQUIREMENTS = INSTALL_REQUIREMENTS + get_requirements(
+    'test-requirements.txt')
 
 
 class TestCommand(Command):
@@ -70,7 +93,7 @@ class TestCommand(Command):
             try:
                 unittest.installHandler()
             except:
-                print "installHandler hack failed"
+                print("installHandler hack failed")
 
         tests = unittest.TestLoader().loadTestsFromNames(testfiles)
         if self.only:
@@ -82,15 +105,14 @@ class TestCommand(Command):
                             newtests.append(testcase)
 
             if not newtests:
-                print "--only didn't find any tests"
+                print("--only didn't find any tests")
                 sys.exit(1)
 
             tests = unittest.TestSuite(newtests)
-            print "Running only:"
+            print("Running only:")
             for test in newtests:
-                print "%s" % test
-            print
-
+                print("%s" % test)
+            print()
 
         t = unittest.TextTestRunner(verbosity=1)
 
@@ -112,6 +134,7 @@ class PylintCommand(Command):
 
     def initialize_options(self):
         pass
+
     def finalize_options(self):
         pass
 
@@ -164,6 +187,7 @@ class RPMCommand(Command):
 
     def initialize_options(self):
         pass
+
     def finalize_options(self):
         pass
 
@@ -186,6 +210,9 @@ setup(name='python-bugzilla',
       packages = ['bugzilla'],
       scripts=['bin/bugzilla'],
       data_files=[('share/man/man1', ['bugzilla.1'])],
+
+      install_requires=INSTALL_REQUIREMENTS,
+      tests_require=TEST_REQUIREMENTS,
 
       cmdclass={
         "pylint" : PylintCommand,

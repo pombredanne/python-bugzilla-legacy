@@ -8,13 +8,19 @@
 '''
 Unit tests that do permanent functional against a real bugzilla instances.
 '''
-
 import datetime
 import os
 import random
 import sys
 import unittest
-import urllib2
+
+if sys.version_info.major >= 3:
+    # pylint: disable=F0401,E0611
+    from urllib.parse import urlparse
+    from xmlrpc.client import Fault
+else:
+    from urlparse import urlparse
+    from xmlrpclib import Fault
 
 import bugzilla
 from bugzilla import Bugzilla
@@ -38,9 +44,9 @@ class BaseTest(unittest.TestCase):
 
     def _testCookie(self):
         cookiefile = cf
-        domain = urllib2.urlparse.urlparse(self.url)[1]
+        domain = urlparse(self.url)[1]
         if os.path.exists(cookiefile):
-            out = file(cookiefile).read(1024)
+            out = open(cookiefile).read(1024)
             if domain in out:
                 return
 
@@ -63,13 +69,13 @@ class RHPartnerTest(BaseTest):
         # Check a known account that likely won't ever go away
         ret = bool(bz.getuser("anaconda-maint-list@redhat.com").groupnames)
         if not ret:
-            print "\nNo admin privs, skipping %s" % funcname
+            print("\nNo admin privs, skipping %s" % funcname)
         return ret
 
     def _check_rh_privs(self, bz, funcname, quiet=False):
         noprivs = bool(bz.getbugs([184858]) == [None])
         if noprivs and not quiet:
-            print "\nNo RH privs, skipping %s" % funcname
+            print("\nNo RH privs, skipping %s" % funcname)
         return not noprivs
 
 
@@ -97,7 +103,7 @@ class RHPartnerTest(BaseTest):
 
         bugid = int(newout.splitlines()[2])
         bug = bz.getbug(bugid)
-        print "\nCreated bugid: %s" % bugid
+        print("\nCreated bugid: %s" % bugid)
 
         # Verify hasattr works
         self.assertTrue(hasattr(bug, "id"))
@@ -142,7 +148,7 @@ class RHPartnerTest(BaseTest):
 
         bugid = int(newout.splitlines()[2])
         bug = bz.getbug(bugid)
-        print "\nCreated bugid: %s" % bugid
+        print("\nCreated bugid: %s" % bugid)
 
         self.assertEquals(bug.summary, summary)
         self.assertEquals(bug.bug_file_loc, url)
@@ -405,14 +411,21 @@ class RHPartnerTest(BaseTest):
 
         # modify --priority
         # modify --severity
-        tests.clicomm(cmd + "--priority low --severity high", bz)
-        bug.refresh()
-        self.assertEquals(bug.priority, "low")
-        self.assertEquals(bug.severity, "high")
-        tests.clicomm(cmd + "--priority medium --severity medium", bz)
-        bug.refresh()
-        self.assertEquals(bug.priority, "medium")
-        self.assertEquals(bug.severity, "medium")
+        options = {
+            'priority': ['low', 'high'],
+            'severity': ['high', 'medium'],
+        }
+        for option in options.keys():
+            try:
+                for level in options[option]:
+                    tests.clicomm(cmd + '--%s %s' % (option, level), bz)
+                    bug.refresh()
+                    self.assertEquals(bug.priority, level)
+            except Fault:
+                e = sys.exc_info()[1]
+                fail_msg = 'You tried to change the %s field from' % (
+                    option.title())
+                self.assertTrue(fail_msg in str(e))
 
         # modify --os
         # modify --platform
@@ -507,8 +520,8 @@ class RHPartnerTest(BaseTest):
 
         self.assertEquals(len(out), 3)
         self.assertEquals(fname, "bz-attach-get1.txt")
-        self.assertEquals(file(fname).read(),
-                          file(testfile).read())
+        self.assertEquals(open(fname).read(),
+                          open(testfile).read())
         os.unlink(fname)
 
         # Get all attachments
@@ -696,7 +709,8 @@ class RHPartnerTest(BaseTest):
             bz.cookiefile = None
             raise AssertionError("Setting cookiefile for active connection "
                                  "should fail.")
-        except RuntimeError, e:
+        except RuntimeError:
+            e = sys.exc_info()[1]
             self.assertTrue("disconnect()" in str(e))
 
         bz.disconnect()
